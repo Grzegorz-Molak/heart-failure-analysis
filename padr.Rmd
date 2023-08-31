@@ -1,0 +1,500 @@
+---
+title: "Heart failure"
+author: "Grzegorz Molak, Maciek Wasiluk"
+date: "2023-08-28"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center')
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(caret)
+library(plotROC)
+library(GGally)
+library(randomForest)
+library(grid)
+library(gridExtra)
+library(cowplot)
+mycolors <- c("#00BFC4", "#F8766D", "#00BA38") 
+df <- read.csv("heart_failure_clinical_records_dataset.csv")
+
+binary_cols <- c("anaemia", "diabetes", "high_blood_pressure", "sex", "smoking")
+numeric_cols <- c("age", "creatinine_phospokinase", "ejection_fraction", "platelets", "serum_creatinine", "serum_sodium")
+
+```
+
+
+## Dane
+
+*Heart failure clinical records. (2020). UCI Machine Learning Repository. https://doi.org/10.24432/C5Z89R.*
+
+#### Aplikacja Shiny
+https://grzegorzmolak.shinyapps.io/HeartFailure/
+
+Dane przedstawiają dane medyczne 299 pacjentów ze zdiagnozowaną niewydolnością serca.
+
+Na podstawie ekspolarcji danych oraz zbudowania modeli przeprowadzona zostanie analiza możliwości
+predykcji niewydolności serca oraz wyodrębnienie głównych cech za nią odpowiedzialnych.
+
+### Eksploracja danych
+#### Liczba unikalnych i brakujących wartości, ich zakres
+
+```{r summary}
+summary <- data.frame()
+for(col in colnames(df)){
+  stats <- list(feature = col,
+                n_unique = n_distinct(df[[col]]),
+                NaNs = sum(is.na(df[[col]])),
+                min=min(df[[col]]), 
+                max=max(df[[col]]))
+  summary <- rbind(summary, stats)
+}
+print(summary)
+```
+`time` jako czas obserwacji pacjenta po zaobserwowaniu niewydolności serca jest naszym zdaniem 
+niewygodna z powodu braku dokładniej wiedzy o znaczeniu tej cechy
+```{r}
+df <- df %>% select(-"time")
+```
+
+#### Cechy o rozkładzie binarnym
+```{r plot_binary, echo=FALSE, fig.dim = c(10,12)}
+plots <- c()
+
+plot_pair <- function(col){
+  colname <- as.name(binary_cols[col])
+  p1 <- df %>%
+      group_by(!!colname) %>%
+      summarize(count = n()/nrow(df)) %>%
+      ggplot(aes(x = as.factor(!!colname), y = count, fill=as.factor(!!colname))) + 
+      geom_bar(stat = "identity") +
+      theme(legend.position="none")+
+      scale_x_discrete(labels=if(binary_cols[col] == "sex") c("Woman", "Man") else c("No", "Yes"))+
+      scale_fill_manual(values=mycolors) +
+      labs(title=paste(binary_cols[col], "[%]"), x=NULL, y=NULL) +
+      geom_text(aes(label = paste(round(count,2)*100,"%")), position=position_dodge(width=0.9), vjust=-0.25)
+  
+  p2 <- df %>%
+      group_by(!!colname) %>%
+      summarize(surv = (1-mean(DEATH_EVENT)))  %>%
+      ggplot(aes(x = as.factor(!!colname), y = surv, fill=as.factor(!!colname))) + 
+      geom_bar(stat = "identity") +
+      theme(legend.position="none")+
+      scale_x_discrete(labels=if(binary_cols[col] == "sex") c("Woman", "Man") else c(binary_cols[col], paste("No",binary_cols[col])))+
+      scale_fill_manual(values=mycolors) +
+      labs(title="Survival rate", x=NULL, y=NULL) +
+      geom_text(aes(label = paste(round(surv,2)*100,"%")), position=position_dodge(width=0.9), vjust=-0.25)
+
+   return(p1 + p2)
+  
+}
+
+death_plot <- df %>%
+      group_by(DEATH_EVENT) %>%
+      summarize(count = n()/nrow(df)) %>%
+      ggplot(aes(x = as.factor(DEATH_EVENT), y = count, fill=as.factor(DEATH_EVENT))) + 
+      geom_bar(stat = "identity") +
+      theme(legend.position="none")+
+      scale_x_discrete(labels=c("Survival", "Death"))+
+      scale_fill_manual(values=mycolors) +
+      labs(title="Death rate", x=NULL) +
+      geom_text(aes(label = paste(round(count,2)*100,"%")), position=position_dodge(width=0.9), vjust=-0.25)
+
+print((plot_pair(1) | plot_pair(2)) /
+      (plot_pair(3) | plot_pair(4)) /
+      (plot_pair(5) | death_plot))
+```
+
+Różnice w przeżywalności dla różnych wartości cech binarnych nie są zbyt duże, największe różnice widoczne są dla anemii oraz nadciśnienia, lecz nawet w tym przypadku jest to około 8 punktów procentowych
+
+#### Pozostałe cechy
+
+```{r create_rest, echo=FALSE}
+legend <- get_legend(
+       df %>%
+       ggplot(aes(x = age, fill=as.factor(DEATH_EVENT))) +
+       geom_density(alpha=0.8) +
+       scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+       theme(legend.position="top"))
+
+p1 <- df %>%
+       ggplot(aes(x = age, fill=as.factor(DEATH_EVENT))) +
+       geom_density(alpha=0.8) +
+       labs(title="Age distribution") +
+       scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+      theme(legend.position="none")
+p2 <- df %>%
+      ggplot(aes(x = creatinine_phosphokinase, fill=as.factor(DEATH_EVENT))) +
+      geom_density(alpha = 0.7) + 
+      scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+      labs(title="Creatinine phospokinase levels", x="level") +
+      theme(legend.position="none")
+p3 <- df %>%
+      ggplot(aes(x = ejection_fraction, fill=as.factor(DEATH_EVENT))) +
+      geom_boxplot(outlier.colour="black", outlier.shape=16,
+                   outlier.size=2) +
+      labs(title="Ejection fraction", x="Ejection fraction[%]") +
+      scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+      theme(legend.position="none")
+p4 <- df %>%
+      ggplot(aes(as.factor(DEATH_EVENT), platelets, fill=as.factor(DEATH_EVENT))) +
+      geom_violin() +
+      labs(title="Platelets", x=NULL) +
+      scale_x_discrete(labels=c("Survival", "Death"))+
+      scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+      theme(legend.position="none")
+p5 <- df %>%
+      ggplot(aes(x = serum_creatinine, fill=as.factor(DEATH_EVENT))) +
+      geom_density(alpha = 0.7) + 
+      scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+      labs(title="Serum creatinine levels", x="level") +
+      theme(legend.position="none")
+p6 <- df %>%
+      ggplot(aes(x = serum_sodium, fill=as.factor(DEATH_EVENT))) +
+      geom_boxplot() +  
+      labs(title="Serum sodium") +
+      scale_fill_manual(name="Outcome", labels=c("Survival", "Death"), values=mycolors) +
+      theme(legend.position="none")
+      
+```
+
+```{r plot_legend, echo=FALSE,  fig.height = 0.5,}
+grid.newpage()
+grid.draw(legend)
+```
+```{r plot_rest, echo=FALSE, fig.dim = c(12, 10)}
+print((p1 + p2) / (p3 + p4) / (p5 + p6))
+```
+
+Można zauważyć, że w przypadku tych cech, dla każdej z nich można zauważyć pewne różnice w dystrybucji
+dla pacjentów którzy przeżyli oraz pacjentów zmarłych. Można przypuszczać, że cechy o ciągłych wartościach
+mogą dostarczyć większych wartości predykcyjnych.
+
+
+#### Macierz korelacji
+Wyznaczymy również 3 cechy o największym module współczynnika korelacji, jako
+podejrzane o wysoką wartość predykcyjną. Czy współczynnik korelacji jest dodatni
+czy ujemny - można wywnioskować na podstawie koloru
+
+```{r corr_coefficient}
+ggcorr(df, method = c("pairwise", "pearson"))
+colnames(cor(df))[order(abs(cor(df)["DEATH_EVENT",1:ncol(df)-1]), decreasing=TRUE)[1:3]]
+```
+
+#### Modele
+Zdecydowaliśmy się stworzyć modele regresji logistycznej
+oraz lasu losowego. Oba radzą sobie całkiem nieźle nawet z niewielką ilością danych: `r nrow(df)`,
+nie wymagają skalowania oraz normalizacji danych,
+w dodatku las losowy umożliwia zbadanie ważności cech na podstawie średniej zmiany współczynnika Giniego.
+
+##### Przygotowanie danych
+Jedyne operacje na danych, aby przygotować je modelu to podział na zbiór treningowy i testowy. Dla wybranych
+modeli skalowanie i normalizacja danych nie są potrzebne.
+```{r split_data}
+set.seed(0)
+df_classification <- df
+df_classification$DEATH_EVENT = factor(df$DEATH_EVENT, levels = c(0, 1))
+ind <- createDataPartition(df_classification$DEATH_EVENT, p = 0.8, list = FALSE)
+trainingset <- df_classification[ind,]
+testingset <- df_classification[-ind,]
+```
+Wielkość zbioru uczącego: `r nrow(trainingset)` oraz testującego: `r nrow(testingset)`
+
+Udział zmarłych pacjentów wewnątrz zbiorów: 
+(`r as.integer(mean(trainingset$DEATH_EVENT == 1)*100)`%, `r as.integer(mean(testingset$DEATH_EVENT == 1)*100)`%)
+
+##### Regresja logistyczna
+```{r log_regression}
+fit_glm <- glm(DEATH_EVENT ~ ., data = trainingset, family = "binomial")
+results_glm <- predict(fit_glm, testingset, type = "response")
+```
+##### Las losowy
+```{r random_forest}
+fit_rf <- randomForest(DEATH_EVENT ~ ., data = trainingset, ntree = 100)
+results_rf <- predict(fit_rf, testingset, type = "prob")
+```
+
+#### Ewaluacje modeli
+```{r models_eval_fun}
+accuracy <- function(actual, predicted, threshold)
+  {
+    mean(as.integer(predicted >= threshold)== actual)
+  }
+
+evaluate <- function(prediction_glm, prediction_rf,
+                       testing_set)
+{
+  thresholds <- seq(0,1, by=.005)
+  metrics <- data.frame()
+  actual <- as.numeric(testing_set$DEATH_EVENT) - 1
+  
+  
+  
+  
+  for(threshold in thresholds)
+  {
+    iter <- c(
+              threshold,
+              ModelMetrics::auc(actual, prediction_glm),
+              ModelMetrics::sensitivity(actual, prediction_glm, threshold),
+              ModelMetrics::specificity(actual, prediction_glm, threshold),
+              accuracy(actual, prediction_glm, threshold),
+              ModelMetrics::precision(actual, prediction_glm, threshold),
+              ModelMetrics::recall(actual, prediction_glm, threshold),
+              ModelMetrics::f1Score(actual, prediction_glm, threshold),
+              #####################################################
+              ModelMetrics::auc(actual,prediction_rf[,2]),
+              ModelMetrics::sensitivity(actual, prediction_rf[,2], threshold),
+              ModelMetrics::specificity(actual, prediction_rf[,2], threshold),
+              accuracy(actual, prediction_rf[,2], threshold),
+              ModelMetrics::precision(actual, prediction_rf[,2], threshold),
+              ModelMetrics::recall(actual, prediction_rf[,2], threshold),
+              ModelMetrics::f1Score(actual, prediction_rf[,2], threshold))
+    metrics <- rbind(metrics, iter)
+  }
+  
+  colnames(metrics) <- c("Threshold", "glm_AUC",
+                         "glm_Sensitivity", "glm_Specificity",
+                         "glm_Accuracy", "glm_Precision",
+                         "glm_Recall", "glm_F1_Score",
+                         "rf_AUC",
+                         "rf_Sensitivity", "rf_Specificity",
+                         "rf_Accuracy", "rf_Precision",
+                         "rf_Recall", "rf_F1_Score")
+return(metrics)
+}
+```
+
+```{r metrics_plots, echo=FALSE}
+plot_metrics <- function(metrics){
+  p1 <- ggplot() + 
+    geom_path(data = metrics, aes(x = Threshold, y = glm_Sensitivity, colour=mycolors[1]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = glm_Specificity, colour=mycolors[2]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = glm_Accuracy, colour=mycolors[3]), linewidth=1) +
+    scale_colour_discrete(name=NULL,
+                           breaks = mycolors,
+                           labels=c("Czułość", "Swoistość", "Dokładność")) +
+    labs(x = "Próg", y = "Wartość", title=" Zależności czułości, swoistości i dokładności\n klasyfikacji od doboru progu dla\n regresji logistycznej") +
+    theme(legend.position="bottom")
+  
+  p2 <- ggplot() + 
+    geom_path(data = metrics, aes(x = Threshold, y = rf_Sensitivity, colour=mycolors[1]),  linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = rf_Specificity, colour=mycolors[2]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = rf_Accuracy, colour=mycolors[3]), linewidth=1) +
+    scale_colour_discrete(name=NULL,
+                           breaks = mycolors,
+                           labels=c("Czułość", "Swoistość", "Dokładność")) +
+    labs(x = "Próg", y = "Wartość", title=" Zależności czułości, swoistości i dokładności\n klasyfikacji od doboru progu dla lasu losowego") +
+    theme(legend.position="bottom")
+  
+  print(p1 + p2)
+  
+  p3 <- ggplot() + 
+    geom_path(data = metrics, aes(x = Threshold, y = glm_Precision, colour=mycolors[1]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = glm_Recall, colour=mycolors[2]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = glm_F1_Score, colour=mycolors[3]), linewidth=1) +
+    scale_colour_discrete(name=NULL,
+                           breaks = mycolors,
+                           labels=c("Precyzja", "Pełność", "Miara F1")) +
+    labs(x = "Próg", y = "Wartość", title="Zależności precyzji, pełności i miary F1\n klasyfikacji od doboru progu dla\n regresji logistycznej") +
+    theme(legend.position="bottom")
+  
+  p4 <- ggplot() + 
+    geom_path(data = metrics, aes(x = Threshold, y = rf_Precision, colour=mycolors[1]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = rf_Recall, colour=mycolors[2]), linewidth=1) +
+    geom_path(data = metrics, aes(x = Threshold, y = rf_F1_Score, colour=mycolors[3]), linewidth=1) +
+    scale_colour_discrete(name=NULL,
+                           breaks = mycolors,
+                           labels=c("Precyzja", "Pełność", "Miara F1")) +
+    labs(x = "Próg", y = "Wartość", title="Zależności precyzji, pełności i miary F1\n klasyfikacji od doboru progu dla lasu losowego") +
+    theme(legend.position="bottom")
+  
+  print(p3 + p4)
+}
+
+plot_roc_prec_recall <- function(metrics){
+  opt_glm <- which.max(metrics$glm_F1_Score)
+  opt_rf <- which.max(metrics$rf_F1_Score)
+  p5 <- ggplot() + 
+        geom_path(data = metrics, aes(x = 1-glm_Specificity, y = glm_Sensitivity, colour=mycolors[1]), linewidth=1) +
+        geom_path(data = metrics, aes(x = 1-rf_Specificity, y = rf_Sensitivity, colour=mycolors[2]), linewidth=1) +
+        geom_point(data = metrics, aes(x = 1 - glm_Specificity[opt_glm], y = glm_Sensitivity[opt_glm]), size = 2.5, colour = mycolors[2]) +
+        geom_point(data = metrics, aes(x = 1 - rf_Specificity[opt_rf], y = rf_Sensitivity[opt_rf]), size = 2.5, colour = mycolors[1]) +
+        scale_colour_discrete(name=NULL,
+                         breaks = mycolors[c(1,2)],
+                         labels=c("Regresja logistyczna", "Las losowy")) +
+        labs(title="Krzywe ROC", x="Odsetek fałszywie pozytywnych", y="Odsetek prawdziwie pozytywnych") +
+        theme(legend.position="bottom")
+  
+
+  p6 <- ggplot() + 
+        geom_path(data = metrics, aes(x = glm_Recall, y = glm_Precision, colour=mycolors[1]), linewidth=1) +
+        geom_path(data = metrics, aes(x = rf_Recall, y = rf_Precision, colour=mycolors[2]), linewidth=1) +
+        geom_point(data = metrics, aes(x = glm_Recall[opt_glm], y = glm_Precision[opt_glm]), size = 2.5, colour = mycolors[2]) +
+        geom_point(data = metrics, aes(x = rf_Recall[opt_rf], y = rf_Precision[opt_rf]), size = 2.5, colour = mycolors[1]) +
+        scale_colour_discrete(name=NULL,
+                         breaks = mycolors[c(1,2)],
+                         labels=c("Regresja logistyczna", "Las losowy")) +
+        labs(x = "Pełność", y = "Precyzja", title="Krzywe prezycji-pełności") +
+        theme(legend.position="bottom")
+  
+  print(p5 + p6)
+}  
+
+
+```
+
+Wyświetlmy wykresy dla modeli
+
+```{r eval_first_models, warning = FALSE, message = FALSE, fig.dim = c(9, 5)}
+
+metrics <- evaluate(results_glm, results_rf, testingset)
+plot_metrics(metrics)
+plot_roc_prec_recall(metrics)
+
+```
+
+Optymalne wartości progów uzyskamy poprzez znalezienie dla każdego z modeli takiej wartości progów,
+aby wartość miary F1 była jak największa. Z racji, że miara F1 średnią harmoniczną precyzji oraz
+pełności, jej najwyższe wartości wskazują w pojedynczej wartości na najlepszy kompromis między precyzją
+oraz pełnością. Możliwe są również inne metody wyboru optymalnego progu jak na przykład maksymalizacja 
+sumy czułości i swoistości, bądź nawet faworyzowanie jednej miary kosztem innej.
+
+Wartości miar dla wyznaczonych progów zostały oznaczone na krzywych w postaci kół. 
+
+```{r print_metrics}
+optimum_glm <- metrics[which.max(metrics$glm_F1_Score),1:8]
+optimum_rf <- metrics[which.max(metrics$rf_F1_Score),c(1, 9:15)]
+optimum_metrics <- t(data.frame(t(optimum_glm), t(optimum_rf)))
+colnames(optimum_metrics) = c("Próg", "AUC", "Czułość", "Swoistość", "Dokładność", "Precyzja", "Pełność", "Miara F1")
+rownames(optimum_metrics) = c("Regresja log.", "Las losowy")
+print(t(optimum_metrics))
+
+```
+
+Na podstawie wybranej miary ustalone zostały progi decyzyjne na poziomie
+`r optimum_glm$Threshold` dla regresji logistcznej i `r optimum_rf$Threshold` dla lasu losowego.
+
+Oznacza to, że przewidujemy śmierć pacjenta dla modelu regresji logistycznej, jeżeli na wyjściu modelu
+otrzymujemy wartość przekraczającą 0.21, podczas gdy dla modelu lasu losowego śmierć pacjenta przewidujemy dopiero
+powyżej wartości 0.37.
+
+Pozostałe wartości mówią między innymi o tym, że przy wybranych progach, dla kolejno modeli regresji
+logistycznej i lasu losowego: 
+
+* Rozpoznawane jest 89.5% i 73.7% przypadków śmierci pacjenta 
+* Rozpoznawane jest 52.5% i 82.5% przypadków przeżycia pacjenta
+* Prawidłowo zgadywane jest 64.5% i 79,7% przypadków
+* Wśród przewidzianych śmierci pacjenta, prawidłowych jest
+47,2% i 70% prawidłowych diagnoz
+
+Widoczne jest, że dla wybranych progów, regresja logistyczna jest znacznie bardziej czuła, 
+to znaczy trafniej przewiduje śmierć pacjenta, lecz powoduje to, że bardzo rzadko
+przewiduje przeżycie. Widoczne jest to przez niską wartość precyzji modelu, która
+wskazuje na dużą ilość "fałszywych pozytywów"
+Z kolei las losowy zdaje się znajdywać pewien kompromis między
+czułością i swoistością.
+W zależności od potrzebnej miary progi decyzyjne można ustawić inaczej, na
+przykład w przypadku gdy zależy nam, aby test wykrywał przypadki pozytywne
+z pewną nie mniejszą od pewnej wartości pewnością, należałoby znaleźć wartość
+progu, dla której przykładowo wartość czułości wynosi 0.95%
+
+#### Ranking cech - redukcja wymiarowości
+
+##### Las losowy
+
+Z modelu lasu losowego nauczonego na całym zbiorze danych zbierzemy
+informacje o ważności poszczególnych cech przy kwalifikacji
+
+```{r importances_rf}
+imp_rf <- randomForest(DEATH_EVENT ~ ., data = df_classification, ntree = 100, importance=TRUE)
+importances = data.frame(rownames(imp_rf$importance), imp_rf$importance[,4])
+colnames(importances) <- c("Feature", "MeanDecreaseGini")
+
+importances %>%
+      ggplot( aes(x=Feature, y=MeanDecreaseGini)) +
+      geom_segment( aes(xend=Feature, yend=0)) +
+      geom_point( size=4, color="orange") +
+      coord_flip() +
+      theme_bw() +
+      xlab("")
+```
+
+##### RFE - recursive feature elimination
+
+Metoda RFE wyznaczania cech(`feature selection`) polega na wykorzystaniu
+innego algorytmu uczenia maszynowego - w naszym przypadku modelu lasu losowego
+oraz pewnej funkcji celu - w naszym przypadku dokładności, do wybrania najlepszego
+podzbioru cech o wybranym rozmiarze na podstawie podanych wcześniej metryk.
+
+Algorytm rozpoczyna działanie tworząc model(lasu losowego) korzystając ze wszystkich dostępnych cech,
+wybiera na jego podstawie najmniej potrzebną cechę, po czym uruchamiany jest znowu,
+z nowym, zmniejszonym zestawem cech - algorytm działa na zasadzie rekurencji.
+
+```{r rfe}
+set.seed(1)
+control_rfe = rfeControl(functions = rfFuncs)
+train_x <- df_classification %>% select(-"DEATH_EVENT")
+train_y <- df_classification$DEATH_EVENT
+result_rfe = rfe(x = train_x, 
+                 y = train_y, 
+                 sizes = c(2:3),
+                 rfeControl = control_rfe,
+                metric = "Accuracy")
+result_rfe$optVariables
+```
+
+### Redukcja wymiarowości
+
+Z przeprowadzonych analiz wynika, że cechami niosącymi największą wartość dla modeli
+są `serum_creatinie`, `ejection_fraction` oraz `age`
+Na podstawie tych założeń zbudowane zostaną te same modele co poprzednio, jednak przy
+wykorzystaniu danych jedynie z wybranych kolumn
+
+##### Wybór podzbiorów
+
+```{r subset_creation} 
+subset <- df_classification %>% select("serum_creatinine", "ejection_fraction", "age", "DEATH_EVENT")
+trainingsubset <- subset[ind,]
+testingsubset <- subset[-ind,]
+```
+
+##### Regresja logistyczna
+```{r log_ref 3 dimensional}
+fit_3glm <- glm(DEATH_EVENT ~ ., data = trainingsubset, family = "binomial")
+results_3glm <- predict(fit_3glm, testingsubset, type = "response")
+```
+
+##### Las losowy
+```{r rf 3 dimensional}
+fit_3rf <- randomForest(DEATH_EVENT ~ ., data = trainingsubset, ntree = 100)
+results_3rf <- predict(fit_3rf, testingsubset, type = "prob")
+```
+
+##### Metryki
+```{r new model metrics, fig.dim = c(9, 5)}
+metrics_subset <- evaluate(results_3glm, results_3rf, testingsubset)
+plot_metrics(metrics_subset)
+plot_roc_prec_recall(metrics_subset)
+```
+
+#### Porównanie metryk dla całego zbioru i 3 wybranych cech(zredukowany zbiór cech)
+```{r metric comparison}
+optimum_3glm <- metrics_subset[which.max(metrics_subset$glm_F1_Score),1:8]
+optimum_3rf <- metrics_subset[which.max(metrics_subset$rf_F1_Score),c(1, 9:15)]
+optimum_metrics <- rbind(optimum_metrics, t(data.frame(t(optimum_3glm), t(optimum_3rf))))
+rownames(optimum_metrics)[c(3,4)] = c("Regresja zred.", "Las losowy zred.")
+print(t(optimum_metrics))
+```
+
+Wyniki nowego modelu regresji logistycznej zdają się być przeciwieństwem modelu opartego na pełnym zestawie cech.
+Uzyskał on znacznie większą swoistość kosztem znacznie mniejszej czułości.
+
+Nowy model lasu losowego nie różni się tak diametralnie od poprzedniego w porównaniu do regresji logistycznej.
+Jest on nieco bardziej czuły, kosztem niewielkiej utraty swoistości oraz precyzji.
+
+Z przeprowadzonych analiz wynika, że przewidywanie przeżywalności na podstawie 3 najważniejszych cech może być co najmniej równie dobra, jak na podstawie wszystkich. Może to wynikać z tego, że zbiór posiada bardzo małą ilość danych(299 rekordów), w związku z czym modelom ciężko jest dopasować się do danych, które mają zbyt dużą liczbę cech.
